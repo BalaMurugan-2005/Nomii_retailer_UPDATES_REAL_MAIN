@@ -22,8 +22,27 @@ EXCEL_FILES = {
     'feedback': 'data/retailer_feedback.xlsx',
     'ai_suggestions': 'data/supplier_ai_suggest_products.xlsx',
     'delivery_assigned': 'data/Delivery_assigned.xlsx',
-    'delivery_history': 'data/DeliveryHistory.xlsx'
+    'delivery_history': 'data/DeliveryHistory.xlsx',
+    'wallet_transactions': 'data/wallet_transactions.xlsx'
 }
+# Create data directory and Excel files if they don't exist
+if not os.path.exists('data'):
+    os.makedirs('data')
+
+for file_path in EXCEL_FILES.values():
+    if not os.path.exists(file_path):
+        # For wallet_transactions, create with specific columns
+        if file_path == EXCEL_FILES['wallet_transactions']:
+            pd.DataFrame(columns=[
+                'TransactionID',
+                'RetailerID',
+                'Amount',
+                'Type',
+                'Date',
+                'Description'
+            ]).to_excel(file_path, index=False)
+        else:
+            pd.DataFrame().to_excel(file_path, index=False)
 
 # Create data directory and Excel files if they don't exist
 if not os.path.exists('data'):
@@ -317,6 +336,157 @@ def view_cart():
     total = sum(item['price'] * item['quantity'] for item in cart)
     
     return render_template('cart.html', cart=cart, total=total)
+# Add these new routes to app.py
+
+@app.route('/add_money', methods=['POST'])
+def add_money():
+    if 'retailer_id' not in session:
+        return redirect(url_for('login'))
+    
+    try:
+        amount = float(request.form['amount'])
+        if amount < 100:
+            flash('Minimum amount to add is ₹100', 'error')
+            return redirect(url_for('wallet'))
+        
+        retailer_id = session['retailer_id']
+        
+        # Record the transaction
+        transaction_id = str(uuid.uuid4())
+        transaction_data = {
+            'TransactionID': transaction_id,
+            'RetailerID': retailer_id,
+            'Amount': amount,
+            'Type': 'Credit',
+            'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'Description': 'Wallet top-up'
+        }
+        
+        # Save to a new wallet_transactions Excel file
+        save_to_excel(transaction_data, 'wallet_transactions')
+        
+        flash(f'₹{amount:.2f} added to your wallet successfully!', 'success')
+    except ValueError:
+        flash('Invalid amount entered', 'error')
+    
+    return redirect(url_for('wallet'))
+
+# Update the wallet route to calculate balance from transactions
+@app.route('/wallet')
+def wallet():
+    if 'retailer_id' not in session:
+        return redirect(url_for('login'))
+    
+    retailer_id = session['retailer_id']
+    
+    # Read wallet transactions
+    try:
+        wallet_transactions = read_excel('wallet_transactions')
+        # Check if 'Type' column exists, if not create empty DataFrame
+        if 'Type' not in wallet_transactions.columns:
+            wallet_transactions = pd.DataFrame(columns=[
+                'TransactionID', 'RetailerID', 'Amount', 'Type', 'Date', 'Description'
+            ])
+        wallet_transactions = wallet_transactions[wallet_transactions['RetailerID'] == retailer_id]
+    except Exception as e:
+        print(f"Error reading wallet transactions: {e}")
+        wallet_transactions = pd.DataFrame(columns=[
+            'TransactionID', 'RetailerID', 'Amount', 'Type', 'Date', 'Description'
+        ])
+    
+    # Calculate wallet balance (sum of all credits minus debits)
+    if not wallet_transactions.empty and 'Type' in wallet_transactions.columns:
+        credits = wallet_transactions[wallet_transactions['Type'] == 'Credit']['Amount'].sum()
+        debits = wallet_transactions[wallet_transactions['Type'] == 'Debit']['Amount'].sum()
+        wallet_balance = credits - debits
+    else:
+        wallet_balance = 0
+    
+    # Read payment history (now using wallet transactions)
+    if not wallet_transactions.empty and 'Type' in wallet_transactions.columns:
+        payment_history = wallet_transactions[wallet_transactions['Type'] == 'Debit'].copy()
+    else:
+        payment_history = pd.DataFrame()
+    
+    # Get pending payments
+    retailer_orders = read_excel('retailer_orders')
+    retailer_orders = retailer_orders[retailer_orders['RetailerID'] == retailer_id]
+    
+    # Get orders that have payment transactions
+    if not payment_history.empty and 'Description' in payment_history.columns:
+        paid_orders = payment_history['Description'].str.extract(r'Payment for order (\w+)')[0].unique()
+    else:
+        paid_orders = []
+    
+    pending_orders = retailer_orders[~retailer_orders['OrderID'].isin(paid_orders)]
+    pending_total = pending_orders.groupby('OrderID').apply(
+        lambda x: (x['Price'] * x['Quantity']).sum()
+    ).sum() if not pending_orders.empty else 0
+    
+    return render_template('wallet.html', 
+                         payment_history=payment_history.to_dict('records'),
+                         wallet_balance=wallet_balance,
+                         pending_total=pending_total)
+
+# Update the make_payment route to deduct from wallet
+@app.route('/make_payment', methods=['POST'])
+def make_payment():
+    if 'retailer_id' not in session:
+        return redirect(url_for('login'))
+    
+    retailer_id = session['retailer_id']
+    order_id = request.form['order_id']
+    
+    # Calculate amount
+    retailer_orders = read_excel('retailer_orders')
+    order_items = retailer_orders[(retailer_orders['RetailerID'] == retailer_id) & 
+                                (retailer_orders['OrderID'] == order_id)]
+    
+    if order_items.empty:
+        flash('No orders found to pay', 'error')
+        return redirect(url_for('wallet'))
+    
+    amount = (order_items['Price'] * order_items['Quantity']).sum()
+    
+    if amount <= 0:
+        flash('Invalid payment amount', 'error')
+        return redirect(url_for('wallet'))
+    
+    # Check wallet balance
+    wallet_transactions = read_excel('wallet_transactions')
+    wallet_transactions = wallet_transactions[wallet_transactions['RetailerID'] == retailer_id]
+    
+    if not wallet_transactions.empty:
+        credits = wallet_transactions[wallet_transactions['Type'] == 'Credit']['Amount'].sum()
+        debits = wallet_transactions[wallet_transactions['Type'] == 'Debit']['Amount'].sum()
+        wallet_balance = credits - debits
+    else:
+        wallet_balance = 0
+    
+    if wallet_balance < amount:
+        flash('Insufficient wallet balance. Please add money to your wallet.', 'error')
+        return redirect(url_for('wallet'))
+    
+    # Record the debit transaction
+    transaction_id = str(uuid.uuid4())
+    transaction_data = {
+        'TransactionID': transaction_id,
+        'RetailerID': retailer_id,
+        'Amount': amount,
+        'Type': 'Debit',
+        'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Description': f'Payment for order {order_id}'
+    }
+    
+    save_to_excel(transaction_data, 'wallet_transactions')
+    
+    # Also update the order status to Paid
+    retailer_orders.loc[(retailer_orders['RetailerID'] == retailer_id) & 
+                      (retailer_orders['OrderID'] == order_id), 'OrderStatus'] = 'Paid'
+    retailer_orders.to_excel(EXCEL_FILES['retailer_orders'], index=False)
+    
+    flash(f'Payment of ₹{amount:.2f} successful!', 'success')
+    return redirect(url_for('wallet'))
 
 @app.route('/place_order', methods=['POST'])
 def place_order():
@@ -329,6 +499,24 @@ def place_order():
     if not cart:
         flash('Your cart is empty!', 'error')
         return redirect(url_for('products'))
+    
+    # Calculate total order amount
+    total_amount = sum(item['price'] * item['quantity'] for item in cart)
+    
+    # Check wallet balance
+    wallet_transactions = read_excel('wallet_transactions')
+    wallet_transactions = wallet_transactions[wallet_transactions['RetailerID'] == retailer_id]
+    
+    if not wallet_transactions.empty:
+        credits = wallet_transactions[wallet_transactions['Type'] == 'Credit']['Amount'].sum()
+        debits = wallet_transactions[wallet_transactions['Type'] == 'Debit']['Amount'].sum()
+        wallet_balance = credits - debits
+    else:
+        wallet_balance = 0
+    
+    if wallet_balance < total_amount:
+        flash(f'Insufficient wallet balance. Your order total is ₹{total_amount:.2f} but you only have ₹{wallet_balance:.2f}. Please add money to your wallet.', 'error')
+        return redirect(url_for('view_cart'))
     
     order_id = str(uuid.uuid4())
     order_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -370,10 +558,32 @@ def place_order():
     }
     save_to_excel(delivery_status_data, 'delivery_status')
     
+    # Deduct from wallet
+    transaction_id = str(uuid.uuid4())
+    transaction_data = {
+        'TransactionID': transaction_id,
+        'RetailerID': retailer_id,
+        'Amount': total_amount,
+        'Type': 'Debit',
+        'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Description': f'Payment for order {order_id}'
+    }
+    save_to_excel(transaction_data, 'wallet_transactions')
+    
+    # Also save to money_spent for backward compatibility
+    payment_data = {
+        'RetailerID': retailer_id,
+        'OrderID': order_id,
+        'AmountPaid': total_amount,
+        'PaymentDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Status': 'Paid'
+    }
+    save_to_excel(payment_data, 'money_spent')
+    
     # Clear cart
     session.pop('cart', None)
     
-    flash('Order placed successfully!', 'success')
+    flash(f'Order placed successfully! ₹{total_amount:.2f} deducted from your wallet.', 'success')
     return redirect(url_for('dashboard'))
 
 @app.route('/track_orders')
@@ -435,60 +645,7 @@ def feedback():
     
     return render_template('feedback.html', order_ids=order_ids)
 
-@app.route('/wallet')
-def wallet():
-    if 'retailer_id' not in session:
-        return redirect(url_for('login'))
-    
-    retailer_id = session['retailer_id']
-    
-    # Read payment history
-    money_spent = read_excel('money_spent')
-    money_spent = money_spent[money_spent['RetailerID'] == retailer_id]
-    
-    # Calculate wallet balance (sum of all payments)
-    wallet_balance = money_spent['AmountPaid'].sum() if not money_spent.empty else 0
-    
-    # Get pending payments
-    retailer_orders = read_excel('retailer_orders')
-    retailer_orders = retailer_orders[retailer_orders['RetailerID'] == retailer_id]
-    paid_orders = money_spent['OrderID'].unique() if not money_spent.empty else []
-    pending_orders = retailer_orders[~retailer_orders['OrderID'].isin(paid_orders)]
-    pending_total = pending_orders.groupby('OrderID').apply(
-        lambda x: (x['Price'] * x['Quantity']).sum()
-    ).sum() if not pending_orders.empty else 0
-    
-    return render_template('wallet.html', 
-                         payment_history=money_spent.to_dict('records'),
-                         wallet_balance=wallet_balance,
-                         pending_total=pending_total)
 
-@app.route('/make_payment', methods=['POST'])
-def make_payment():
-    if 'retailer_id' not in session:
-        return redirect(url_for('login'))
-    
-    retailer_id = session['retailer_id']
-    order_id = request.form['order_id']
-    
-    # Calculate amount (simplified)
-    retailer_orders = read_excel('retailer_orders')
-    order_items = retailer_orders[(retailer_orders['RetailerID'] == retailer_id) & 
-                                (retailer_orders['OrderID'] == order_id)]
-    amount = (order_items['Price'] * order_items['Quantity']).sum()
-    
-    # Record payment
-    payment_data = {
-        'RetailerID': retailer_id,
-        'OrderID': order_id,
-        'AmountPaid': amount,
-        'PaymentDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'Status': 'Paid'
-    }
-    save_to_excel(payment_data, 'money_spent')
-    
-    flash('Payment successful!', 'success')
-    return redirect(url_for('wallet'))
 
 @app.route('/profile', methods=['GET', 'POST'])
 def profile():
