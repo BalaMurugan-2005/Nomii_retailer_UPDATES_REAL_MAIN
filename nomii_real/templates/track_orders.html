@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Track Your Orders</title>
     <style>
+        /* ... (keep all your existing styles) ... */
+        
+        /* Add these new styles */
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             margin: 0;
@@ -190,6 +193,81 @@
             padding: 40px 0;
             color: #7f8c8d;
         }
+        
+        .status-pending {
+            background-color: #f39c12;
+            color: white;
+        }
+        .status-paid {
+            background-color: #3498db;
+            color: white;
+        }
+        .status-picked {
+            background-color: #9b59b6;
+            color: white;
+        }
+        .status-in-transit {
+            background-color: #f1c40f;
+            color: white;
+        }
+        .status-delivered {
+            background-color: #27ae60;
+            color: white;
+        }
+        .status-cancelled {
+            background-color: #e74c3c;
+            color: white;
+        }
+        .status-actions {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .status-btn {
+            padding: 8px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        .status-btn:hover {
+            opacity: 0.9;
+            transform: translateY(-2px);
+        }
+        .btn-picked {
+            background-color: #9b59b6;
+            color: white;
+        }
+        .btn-transit {
+            background-color: #f1c40f;
+            color: white;
+        }
+        .btn-delivered {
+            background-color: #27ae60;
+            color: white;
+        }
+        .btn-cancelled {
+            background-color: #e74c3c;
+            color: white;
+        }
+        .alert {
+            padding: 10px 15px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .alert-error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .hidden-form {
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -216,6 +294,17 @@
         <div class="page-header">
             <h2>Track Your Orders</h2>
         </div>
+        
+        <!-- Flash messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'error' if category == 'error' else 'success' }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
         
         <div class="orders-container">
             {% if orders %}
@@ -258,7 +347,7 @@
                                         <td>
                                             <div class="product-cell">
                                                 <div class="product-image">
-                                                    <img src="https://via.placeholder.com/40?text=Prod" alt="{{ product['ProductName'] }}">
+                                                    <img src="{{ product['image_url'] if 'image_url' in product else 'https://via.placeholder.com/40?text=Prod' }}" alt="{{ product['ProductName'] }}">
                                                 </div>
                                                 <span>{{ product['ProductName'] }}</span>
                                             </div>
@@ -268,17 +357,58 @@
                                         <td>₹{{ "%.2f"|format(product['Price'] * product['Quantity']) }}</td>
                                     </tr>
                                 {% endfor %}
+                                <tr>
+                                    <td colspan="3" style="text-align: right; font-weight: bold;">Order Total:</td>
+                                    <td style="font-weight: bold;">
+                                        ₹{{ "%.2f"|format(order['products']|sum(attribute='Price') * order['products']|sum(attribute='Quantity')) }}
+                                    </td>
+                                </tr>
                             </tbody>
                         </table>
+                        
+                        <!-- Status Update Section -->
+                        <div class="status-actions">
+    {% if order['status'].lower() == 'pending' %}
+        <button class="status-btn btn-picked" onclick="showUpdateForm('{{ order['order_id'] }}', 'Picked')">Mark as Picked</button>
+    {% endif %}
+    
+    {% if order['status'].lower() == 'picked' %}
+        <button class="status-btn btn-transit" onclick="showUpdateForm('{{ order['order_id'] }}', 'In Transit')">Mark as In Transit</button>
+    {% endif %}
+    
+    {% if order['status'].lower() in ['picked', 'in transit'] %}
+        <button class="status-btn btn-delivered" onclick="showUpdateForm('{{ order['order_id'] }}', 'Delivered')">Mark as Delivered</button>
+    {% endif %}
+    
+    {% if order['status'].lower() not in ['delivered', 'cancelled'] %}
+        <button class="status-btn btn-cancelled" onclick="showUpdateForm('{{ order['order_id'] }}', 'Cancelled')">Cancel Order</button>
+    {% endif %}
+</div>
+
+                        <!-- Hidden Update Form -->
+                        <form id="updateForm-{{ order['order_id'] }}" class="hidden-form" method="POST" action="{{ url_for('update_order_status') }}">
+                            <input type="hidden" name="order_id" value="{{ order['order_id'] }}">
+                            <input type="hidden" name="new_status" id="newStatus-{{ order['order_id'] }}" value="">
+                            <button type="submit" id="submitBtn-{{ order['order_id'] }}"></button>
+                        </form>
                     </div>
                 {% endfor %}
             {% else %}
                 <div class="no-orders">
                     <h3>No orders found</h3>
-                    <p>You haven't placed any orders yet.</p>
+                    <p>You haven't placed any paid orders yet.</p>
                 </div>
             {% endif %}
         </div>
     </div>
+    
+    <script>
+        function showUpdateForm(orderId, newStatus) {
+            if (confirm(`Are you sure you want to mark this order as ${newStatus}?`)) {
+                document.getElementById(`newStatus-${orderId}`).value = newStatus;
+                document.getElementById(`submitBtn-${orderId}`).click();
+            }
+        }
+    </script>
 </body>
 </html>

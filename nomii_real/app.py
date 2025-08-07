@@ -5,7 +5,7 @@ from io import BytesIO
 import base64
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 
 app = Flask(__name__)
@@ -338,6 +338,55 @@ def view_cart():
     return render_template('cart.html', cart=cart, total=total)
 # Add these new routes to app.py
 
+
+
+# Update the wallet route to calculate balance from transactions
+# Add these routes to your existing app.py
+
+@app.route('/wallet')
+def wallet():
+    if 'retailer_id' not in session:
+        return redirect(url_for('login'))
+    
+    retailer_id = session['retailer_id']
+    
+    # Read wallet transactions
+    wallet_transactions = read_excel('wallet_transactions')
+    wallet_transactions = wallet_transactions[wallet_transactions['RetailerID'] == retailer_id]
+    
+    # Calculate wallet balance (sum of all credits minus debits)
+    if not wallet_transactions.empty:
+        credits = wallet_transactions[wallet_transactions['Type'] == 'Credit']['Amount'].sum()
+        debits = wallet_transactions[wallet_transactions['Type'] == 'Debit']['Amount'].sum()
+        wallet_balance = credits - debits
+    else:
+        wallet_balance = 0
+    
+    # Get payment history (all transactions)
+    payment_history = wallet_transactions.sort_values('Date', ascending=False)
+    
+    # Get pending payments (orders not yet paid)
+    retailer_orders = read_excel('retailer_orders')
+    retailer_orders = retailer_orders[retailer_orders['RetailerID'] == retailer_id]
+    
+    # Get paid orders from transaction history
+    paid_orders = []
+    if not wallet_transactions.empty:
+        paid_orders = wallet_transactions[
+            wallet_transactions['Description'].str.startswith('Payment for order')
+        ]['Description'].str.extract(r'Payment for order (\w+)')[0].unique()
+    
+    # Calculate pending total
+    pending_orders = retailer_orders[~retailer_orders['OrderID'].isin(paid_orders)]
+    pending_total = pending_orders.groupby('OrderID').apply(
+        lambda x: (x['Price'] * x['Quantity']).sum()
+    ).sum() if not pending_orders.empty else 0
+    
+    return render_template('wallet.html', 
+                         payment_history=payment_history.to_dict('records'),
+                         wallet_balance=wallet_balance,
+                         pending_total=pending_total)
+
 @app.route('/add_money', methods=['POST'])
 def add_money():
     if 'retailer_id' not in session:
@@ -362,7 +411,6 @@ def add_money():
             'Description': 'Wallet top-up'
         }
         
-        # Save to a new wallet_transactions Excel file
         save_to_excel(transaction_data, 'wallet_transactions')
         
         flash(f'₹{amount:.2f} added to your wallet successfully!', 'success')
@@ -371,64 +419,6 @@ def add_money():
     
     return redirect(url_for('wallet'))
 
-# Update the wallet route to calculate balance from transactions
-@app.route('/wallet')
-def wallet():
-    if 'retailer_id' not in session:
-        return redirect(url_for('login'))
-    
-    retailer_id = session['retailer_id']
-    
-    # Read wallet transactions
-    try:
-        wallet_transactions = read_excel('wallet_transactions')
-        # Check if 'Type' column exists, if not create empty DataFrame
-        if 'Type' not in wallet_transactions.columns:
-            wallet_transactions = pd.DataFrame(columns=[
-                'TransactionID', 'RetailerID', 'Amount', 'Type', 'Date', 'Description'
-            ])
-        wallet_transactions = wallet_transactions[wallet_transactions['RetailerID'] == retailer_id]
-    except Exception as e:
-        print(f"Error reading wallet transactions: {e}")
-        wallet_transactions = pd.DataFrame(columns=[
-            'TransactionID', 'RetailerID', 'Amount', 'Type', 'Date', 'Description'
-        ])
-    
-    # Calculate wallet balance (sum of all credits minus debits)
-    if not wallet_transactions.empty and 'Type' in wallet_transactions.columns:
-        credits = wallet_transactions[wallet_transactions['Type'] == 'Credit']['Amount'].sum()
-        debits = wallet_transactions[wallet_transactions['Type'] == 'Debit']['Amount'].sum()
-        wallet_balance = credits - debits
-    else:
-        wallet_balance = 0
-    
-    # Read payment history (now using wallet transactions)
-    if not wallet_transactions.empty and 'Type' in wallet_transactions.columns:
-        payment_history = wallet_transactions[wallet_transactions['Type'] == 'Debit'].copy()
-    else:
-        payment_history = pd.DataFrame()
-    
-    # Get pending payments
-    retailer_orders = read_excel('retailer_orders')
-    retailer_orders = retailer_orders[retailer_orders['RetailerID'] == retailer_id]
-    
-    # Get orders that have payment transactions
-    if not payment_history.empty and 'Description' in payment_history.columns:
-        paid_orders = payment_history['Description'].str.extract(r'Payment for order (\w+)')[0].unique()
-    else:
-        paid_orders = []
-    
-    pending_orders = retailer_orders[~retailer_orders['OrderID'].isin(paid_orders)]
-    pending_total = pending_orders.groupby('OrderID').apply(
-        lambda x: (x['Price'] * x['Quantity']).sum()
-    ).sum() if not pending_orders.empty else 0
-    
-    return render_template('wallet.html', 
-                         payment_history=payment_history.to_dict('records'),
-                         wallet_balance=wallet_balance,
-                         pending_total=pending_total)
-
-# Update the make_payment route to deduct from wallet
 @app.route('/make_payment', methods=['POST'])
 def make_payment():
     if 'retailer_id' not in session:
@@ -439,8 +429,10 @@ def make_payment():
     
     # Calculate amount
     retailer_orders = read_excel('retailer_orders')
-    order_items = retailer_orders[(retailer_orders['RetailerID'] == retailer_id) & 
-                                (retailer_orders['OrderID'] == order_id)]
+    order_items = retailer_orders[(retailer_orders['RetailerID'] == retailer_id)]
+    
+    if order_id != 'all':
+        order_items = order_items[order_items['OrderID'] == order_id]
     
     if order_items.empty:
         flash('No orders found to pay', 'error')
@@ -467,22 +459,53 @@ def make_payment():
         flash('Insufficient wallet balance. Please add money to your wallet.', 'error')
         return redirect(url_for('wallet'))
     
-    # Record the debit transaction
-    transaction_id = str(uuid.uuid4())
-    transaction_data = {
-        'TransactionID': transaction_id,
-        'RetailerID': retailer_id,
-        'Amount': amount,
-        'Type': 'Debit',
-        'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'Description': f'Payment for order {order_id}'
-    }
+    # Record the debit transaction(s)
+    if order_id == 'all':
+        # Pay all pending orders
+        paid_orders = []
+        if not wallet_transactions.empty:
+            paid_orders = wallet_transactions[
+                wallet_transactions['Description'].str.startswith('Payment for order')
+            ]['Description'].str.extract(r'Payment for order (\w+)')[0].unique()
+        
+        pending_orders = order_items[~order_items['OrderID'].isin(paid_orders)]
+        order_groups = pending_orders.groupby('OrderID')
+        
+        for order_id, group in order_groups:
+            order_amount = (group['Price'] * group['Quantity']).sum()
+            
+            transaction_id = str(uuid.uuid4())
+            transaction_data = {
+                'TransactionID': transaction_id,
+                'RetailerID': retailer_id,
+                'Amount': order_amount,
+                'Type': 'Debit',
+                'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Description': f'Payment for order {order_id}'
+            }
+            save_to_excel(transaction_data, 'wallet_transactions')
+            
+            # Update order status
+            retailer_orders.loc[(retailer_orders['RetailerID'] == retailer_id) & 
+                              (retailer_orders['OrderID'] == order_id), 'OrderStatus'] = 'Paid'
+    else:
+        # Pay single order
+        transaction_id = str(uuid.uuid4())
+        transaction_data = {
+            'TransactionID': transaction_id,
+            'RetailerID': retailer_id,
+            'Amount': amount,
+            'Type': 'Debit',
+            'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'Description': f'Payment for order {order_id}'
+        }
+        save_to_excel(transaction_data, 'wallet_transactions')
+        
+        # Update order status
+        retailer_orders.loc[(retailer_orders['RetailerID'] == retailer_id) & 
+                          (retailer_orders['OrderID'] == order_id), 'OrderStatus'] = 'Paid'
     
-    save_to_excel(transaction_data, 'wallet_transactions')
-    
-    # Also update the order status to Paid
-    retailer_orders.loc[(retailer_orders['RetailerID'] == retailer_id) & 
-                      (retailer_orders['OrderID'] == order_id), 'OrderStatus'] = 'Paid'
+    # Save updated orders
     retailer_orders.to_excel(EXCEL_FILES['retailer_orders'], index=False)
     
     flash(f'Payment of ₹{amount:.2f} successful!', 'success')
@@ -597,29 +620,97 @@ def track_orders():
     retailer_orders = read_excel('retailer_orders')
     retailer_orders = retailer_orders[retailer_orders['RetailerID'] == retailer_id]
     
-    # Get unique order IDs
-    order_ids = retailer_orders['OrderID'].unique()
-    
     # Get delivery status for each order
     delivery_status = read_excel('delivery_status')
     orders_with_status = []
     
-    for order_id in order_ids:
+    for order_id in retailer_orders['OrderID'].unique():
         order_products = retailer_orders[retailer_orders['OrderID'] == order_id]
-        status = delivery_status[delivery_status['OrderID'] == order_id]
         
+        # Get delivery status
+        status = delivery_status[delivery_status['OrderID'] == order_id]
         if not status.empty:
-            status = status.iloc[0]
+            status = status.iloc[0].to_dict()
+        else:
+            # Create default status if not found
+            status = {
+                'DeliveryPerson': '',
+                'Status': 'Pending',
+                'PickedDate': '',
+                'DeliveredDate': ''
+            }
+        
+        # Check if order is paid
+        wallet_transactions = read_excel('wallet_transactions')
+        is_paid = False
+        if not wallet_transactions.empty:
+            is_paid = any(
+                (wallet_transactions['RetailerID'] == retailer_id) & 
+                (wallet_transactions['Description'].str.contains(f'Payment for order {order_id}'))
+            )
+        
+        # Only show paid orders (or all orders if you want to show unpaid ones too)
+        if is_paid:
             orders_with_status.append({
                 'order_id': order_id,
                 'products': order_products.to_dict('records'),
                 'delivery_person': status['DeliveryPerson'],
                 'status': status['Status'],
-                'expected_delivery': order_products.iloc[0]['OrderDate']  # Simplified
+                'expected_delivery': (datetime.strptime(order_products.iloc[0]['OrderDate'], '%Y-%m-%d %H:%M:%S') + timedelta(days=3)).strftime('%Y-%m-%d')
             })
     
     return render_template('track_orders.html', orders=orders_with_status)
-
+@app.route('/update_order_status', methods=['POST'])
+def update_order_status():
+    if 'retailer_id' not in session:
+        return redirect(url_for('login'))
+    
+    order_id = request.form['order_id']
+    new_status = request.form['new_status']
+    retailer_id = session['retailer_id']
+    
+    # Update delivery status
+    delivery_status = read_excel('delivery_status')
+    
+    # Find the order in delivery status
+    if not delivery_status.empty and 'OrderID' in delivery_status.columns:
+        order_index = delivery_status[delivery_status['OrderID'] == order_id].index
+        
+        if not order_index.empty:
+            # Update existing record
+            delivery_status.loc[order_index, 'Status'] = new_status
+            
+            # Update timestamps
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if new_status == 'Picked':
+                delivery_status.loc[order_index, 'PickedDate'] = now
+            elif new_status == 'Delivered':
+                delivery_status.loc[order_index, 'DeliveredDate'] = now
+        else:
+            # Create new record if not exists
+            new_record = {
+                'OrderID': order_id,
+                'DeliveryPerson': '',
+                'Status': new_status,
+                'PickedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S') if new_status == 'Picked' else '',
+                'DeliveredDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S') if new_status == 'Delivered' else ''
+            }
+            delivery_status = pd.concat([delivery_status, pd.DataFrame([new_record])], ignore_index=True)
+        
+        # Save back to Excel
+        delivery_status.to_excel(EXCEL_FILES['delivery_status'], index=False)
+        
+        # Also update retailer_orders status if needed
+        retailer_orders = read_excel('retailer_orders')
+        if not retailer_orders.empty and 'OrderID' in retailer_orders.columns:
+            retailer_orders.loc[retailer_orders['OrderID'] == order_id, 'OrderStatus'] = new_status
+            retailer_orders.to_excel(EXCEL_FILES['retailer_orders'], index=False)
+        
+        flash(f'Order #{order_id} status updated to {new_status}', 'success')
+    else:
+        flash('Error updating order status', 'error')
+    
+    return redirect(url_for('track_orders'))
 @app.route('/feedback', methods=['GET', 'POST'])
 def feedback():
     if 'retailer_id' not in session:
